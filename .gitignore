@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+/output/*
+!/output/.gitkeep
+/models/*.pt
+!/models/yolov8n.pt

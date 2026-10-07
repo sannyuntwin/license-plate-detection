@@ -1,0 +1,5 @@
+ultralytics
+opencv-python
+easyocr
+numpy<2
+pandas
