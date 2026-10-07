@@ -1,5 +1,6 @@
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 def parse_args():
@@ -11,8 +12,14 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, default=Path("output/plates"))
     parser.add_argument("--csv", type=Path, default=Path("output/results.csv"))
     parser.add_argument("--frame-skip", type=int, default=2)
-    parser.add_argument("--display-every", type=int, default=3)
+    parser.add_argument("--display-every", type=int, default=1,
+                        help="Display every N source video frames")
     parser.add_argument("--no-display", action="store_true", help="Run without opening a video window")
+    parser.add_argument(
+        "--precise-boxes",
+        action="store_true",
+        help="Detect every frame synchronously so boxes align with the displayed frame",
+    )
     args = parser.parse_args()
 
     if not 0 < args.confidence <= 1:
@@ -32,6 +39,68 @@ def box_iou(first, second):
     second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
     union = first_area + second_area - intersection
     return intersection / union if union else 0
+
+
+def _detect_frame(frame, frame_id, detector, ocr, output_dir, cv2):
+    detections = []
+    for index, (x1, y1, x2, y2) in enumerate(detector.detect(frame)):
+        plate_img = frame[y1:y2, x1:x2]
+        if plate_img.size == 0:
+            continue
+
+        plate_text = ocr.read_text(plate_img)
+        plate_filename = f"plate_{frame_id}_{index}.jpg"
+        plate_path = output_dir / plate_filename
+        if not cv2.imwrite(str(plate_path), plate_img):
+            raise OSError(f"Could not save plate image: {plate_path}")
+        detections.append((index, x1, y1, x2, y2, plate_text, plate_filename))
+
+    return frame_id, detections
+
+
+def _update_tracks(frame_id, detections, tracks, max_track_gap):
+    annotations = []
+    current_plates = 0
+    matched_tracks = set()
+
+    for index, x1, y1, x2, y2, plate_text, plate_filename in detections:
+        box = (x1, y1, x2, y2)
+        best_track_index = None
+        best_iou = 0.25
+        for track_index, track in enumerate(tracks):
+            if track_index in matched_tracks or frame_id - track["last_frame"] > max_track_gap:
+                continue
+            overlap = box_iou(box, track["box"])
+            if overlap > best_iou:
+                best_iou = overlap
+                best_track_index = track_index
+
+        if best_track_index is None:
+            track = {
+                "first_frame": frame_id,
+                "last_frame": frame_id,
+                "box": box,
+                "texts": {},
+                "image": None,
+            }
+            tracks.append(track)
+            best_track_index = len(tracks) - 1
+        else:
+            track = tracks[best_track_index]
+            track["last_frame"] = frame_id
+            track["box"] = box
+        matched_tracks.add(best_track_index)
+
+        if track["image"] is None:
+            track["image"] = plate_filename
+        annotations.append((x1, y1, x2, y2, plate_text))
+
+        normalized_text = "".join(character for character in plate_text.upper() if character.isalnum())
+        if normalized_text:
+            current_plates += 1
+            track["texts"][normalized_text] = track["texts"].get(normalized_text, 0) + 1
+
+    return annotations, current_plates
 
 
 def main():
@@ -66,88 +135,82 @@ def main():
     frame_id = 0
     processed_frames = 0
     tracks = []
-    max_track_gap = max(args.frame_skip * 5, 10)
+    max_track_gap = max(args.frame_skip * 5, int(fps * 2), 10)
     start_time = time.time()
     last_progress_time = start_time
+    playback_start = time.monotonic()
+    last_annotations = []
+    last_plates = 0
+    pending_detection = None
+    executor = ThreadPoolExecutor(max_workers=1)
 
     try:
         while True:
+            if not args.no_display and not args.precise_boxes and fps > 0:
+                target_frame = int((time.monotonic() - playback_start) * fps) + 1
+                while frame_id + 1 < target_frame:
+                    if not cap.grab():
+                        break
+                    frame_id += 1
+
             ret, frame = cap.read()
             if not ret:
                 break
 
             frame_id += 1
-            if frame_id % args.frame_skip != 0:
-                continue
+            should_detect = args.precise_boxes or frame_id % args.frame_skip == 0
+            if pending_detection is not None and pending_detection.done():
+                detected_frame_id, detections = pending_detection.result()
+                last_annotations, last_plates = _update_tracks(
+                    detected_frame_id, detections, tracks, max_track_gap
+                )
+                pending_detection = None
 
-            processed_frames += 1
-            boxes = detector.detect(frame)
-            current_plates = 0
-            matched_tracks = set()
+            if should_detect:
+                if args.no_display or args.precise_boxes:
+                    detected_frame_id, detections = _detect_frame(
+                        frame, frame_id, detector, ocr, args.output_dir, cv2
+                    )
+                    last_annotations, last_plates = _update_tracks(
+                        detected_frame_id, detections, tracks, max_track_gap
+                    )
+                    processed_frames += 1
+                elif pending_detection is None:
+                    pending_detection = executor.submit(
+                        _detect_frame, frame.copy(), frame_id, detector, ocr,
+                        args.output_dir, cv2
+                    )
+                    processed_frames += 1
 
-            for index, (x1, y1, x2, y2) in enumerate(boxes):
-                box = (x1, y1, x2, y2)
-                best_track_index = None
-                best_iou = 0.25
-                for track_index, track in enumerate(tracks):
-                    if track_index in matched_tracks or frame_id - track["last_frame"] > max_track_gap:
-                        continue
-                    overlap = box_iou(box, track["box"])
-                    if overlap > best_iou:
-                        best_iou = overlap
-                        best_track_index = track_index
-
-                if best_track_index is None:
-                    track = {
-                        "first_frame": frame_id,
-                        "last_frame": frame_id,
-                        "box": box,
-                        "texts": {},
-                        "image": None,
-                    }
-                    tracks.append(track)
-                    best_track_index = len(tracks) - 1
-                else:
-                    track = tracks[best_track_index]
-                    track["last_frame"] = frame_id
-                    track["box"] = box
-                matched_tracks.add(best_track_index)
-
-                plate_img = frame[y1:y2, x1:x2]
-                if plate_img.size == 0:
-                    continue
-
-                plate_text = ocr.read_text(plate_img)
-                plate_filename = f"plate_{frame_id}_{index}.jpg"
-                if not cv2.imwrite(str(args.output_dir / plate_filename), plate_img):
-                    raise OSError(f"Could not save plate image: {args.output_dir / plate_filename}")
-                if track["image"] is None:
-                    track["image"] = plate_filename
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, plate_text, (x1, max(y1 - 10, 0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-                if plate_text:
-                    normalized_text = "".join(character for character in plate_text.upper() if character.isalnum())
-                    if normalized_text:
-                        current_plates += 1
-                        track["texts"][normalized_text] = track["texts"].get(normalized_text, 0) + 1
-
-            if not args.no_display and processed_frames % args.display_every == 0:
+            if not args.no_display and frame_id % args.display_every == 0:
                 elapsed = max(time.time() - start_time, 0.001)
                 info_text = (
-                    f"Frame: {frame_id}/{total_frames} | Plates: {current_plates} | "
+                    f"Frame: {frame_id}/{total_frames} | Plates: {last_plates} | "
                     f"FPS: {processed_frames / elapsed:.1f}"
                 )
                 cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.6, (255, 255, 255), 2)
+                for x1, y1, x2, y2, plate_text in last_annotations:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, plate_text, (x1, max(y1 - 10, 0)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("License Plate Detection", frame)
-                key = cv2.waitKey(1) & 0xFF
+                wait_ms = 1
+                if fps > 0:
+                    target_time = playback_start + (frame_id - 1) / fps
+                    wait_ms = max(1, round((target_time - time.monotonic()) * 1000))
+                key = cv2.waitKey(wait_ms) & 0xFF
                 if key == ord("q"):
                     break
                 if key == ord(" "):
-                    cv2.waitKey(0)
+                    pause_start = time.monotonic()
+                    while True:
+                        key = cv2.waitKey(0) & 0xFF
+                        if key in (ord(" "), ord("q")):
+                            playback_start += time.monotonic() - pause_start
+                            break
+                    if key == ord("q"):
+                        break
 
             current_time = time.time()
             if current_time - last_progress_time >= 5:
@@ -162,6 +225,13 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        executor.shutdown(wait=True)
+
+    if pending_detection is not None:
+        detected_frame_id, detections = pending_detection.result()
+        last_annotations, last_plates = _update_tracks(
+            detected_frame_id, detections, tracks, max_track_gap
+        )
 
     results_data = []
     for track in tracks:

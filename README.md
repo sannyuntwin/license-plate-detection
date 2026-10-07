@@ -31,4 +31,4 @@ For a model whose plate class is named generically, pass its class index:
 python run_visual.py --video data/videos/car.mp4 --model models/license-plate.pt --class-id 0
 ```
 
-Useful options include `--confidence`, `--frame-skip`, `--display-every`, `--output-dir`, `--csv`, and `--no-display`. Run `python run_visual.py --help` for the full list. The default CSV and cropped plate images are written under `output/`.
+Use `--precise-boxes` to detect every frame and align boxes exactly with the displayed frame; playback may be slower while inference runs. Other options include `--confidence`, `--frame-skip`, `--display-every`, `--output-dir`, `--csv`, and `--no-display`. Run `python run_visual.py --help` for the full list. The default CSV and cropped plate images are written under `output/`.
